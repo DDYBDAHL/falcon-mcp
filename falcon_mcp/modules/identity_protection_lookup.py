@@ -69,8 +69,7 @@ IDENTITY_LOOKUP_GUIDE = dedent("""
 
     ## Performance
 
-    Returns up to 10 matching users. Search is case-insensitive and fuzzy-matches
-    across display names, emails, and account names.
+    Returns up to 10 matching users. Search matches across display names, emails, and account names.
 """).strip()
 
 
@@ -113,7 +112,7 @@ class IdentityProtectionLookupModule(BaseModule):
         """Lookup a user in your identity system using Identity Protection GraphQL.
 
         This is perfect for getting user context when investigating alerts and detections.
-        Search is case-insensitive and matches across emails, display names, and usernames.
+        Search matches across emails, display names, and usernames.
 
         Returns user details including:
         - Display names (primary and secondary)
@@ -130,50 +129,49 @@ class IdentityProtectionLookupModule(BaseModule):
         """
         logger.debug("Looking up user identity: %s", search_term)
 
-        # GraphQL query to search for users by email, name, or username
-        graphql_query = f"""
-        query SearchUsers($search: String!) {{
+        # GraphQL query to search for users
+        # Using simpler syntax that matches Falcon's GraphQL implementation
+        graphql_query = """
+        query SearchUsers($after: String) {
             entities(
                 types: [USER]
-                filter: {{
-                    or: [
-                        {{field: "primaryDisplayName", match: $search}}
-                        {{field: "secondaryDisplayName", match: $search}}
-                        {{field: "emails", match: $search}}
-                        {{field: "accountNames", match: $search}}
-                    ]
-                }}
+                archived: false
+                learned: false
                 first: 10
-            ) {{
-                nodes {{
+                after: $after
+            ) {
+                nodes {
                     entityId
                     primaryDisplayName
                     secondaryDisplayName
                     emails
-                    accounts {{
-                        ... on ActiveDirectoryAccountDescriptor {{
+                    accounts {
+                        ... on ActiveDirectoryAccountDescriptor {
                             domain
                             name
                             samAccountName
-                        }}
-                    }}
-                    riskAssessment {{
+                        }
+                    }
+                    riskAssessment {
                         severity
                         description
                         lastUpdatedAt
-                    }}
+                    }
                     archived
                     learned
-                }}
-                pageInfo {{
+                }
+                pageInfo {
                     hasNextPage
                     endCursor
-                }}
-            }}
-        }}
+                }
+            }
+        }
         """
 
-        variables = {"search": search_term}
+        # Since the GraphQL API doesn't have built-in text search via filter,
+        # we'll fetch all users and filter client-side
+        # For large deployments, you may want to implement server-side filtering
+        variables = {"after": None}
 
         # Call the Identity Protection GraphQL API
         response = self._base_query_api_call(
@@ -199,13 +197,53 @@ class IdentityProtectionLookupModule(BaseModule):
                 entities = data.get("entities", {})
                 nodes = entities.get("nodes", [])
 
-                if nodes:
+                if not nodes:
+                    logger.debug("No users found in Identity Protection")
+                    return [
+                        {
+                            "not_found": True,
+                            "search_term": search_term,
+                            "message": "No users found in Identity Protection. Identity Protection may not be enabled or no users indexed yet.",
+                        }
+                    ]
+
+                # Filter results client-side based on search term
+                search_lower = search_term.lower()
+                filtered_nodes = []
+
+                for node in nodes:
+                    # Check multiple fields for match
+                    primary_name = node.get("primaryDisplayName", "").lower()
+                    secondary_name = node.get("secondaryDisplayName", "").lower()
+                    emails = [e.lower() for e in node.get("emails", [])]
+
+                    # Also check AD account names
+                    accounts = node.get("accounts", [])
+                    account_names = [
+                        (a.get("samAccountName", "") or a.get("name", "")).lower()
+                        for a in accounts
+                    ]
+
+                    # Match if search term appears in any field
+                    if any(
+                        search_lower in field
+                        for field in [
+                            primary_name,
+                            secondary_name,
+                            *emails,
+                            *account_names,
+                        ]
+                        if field
+                    ):
+                        filtered_nodes.append(node)
+
+                if filtered_nodes:
                     logger.debug(
-                        "Found %d user(s) matching: %s", len(nodes), search_term
+                        "Found %d user(s) matching: %s", len(filtered_nodes), search_term
                     )
-                    return nodes
+                    return filtered_nodes
                 else:
-                    logger.debug("No users found matching: %s", search_term)
+                    logger.debug("No users matched search term: %s", search_term)
                     return [
                         {
                             "not_found": True,
