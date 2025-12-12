@@ -1,9 +1,9 @@
 """
-Identity Protection User Lookup module for Falcon MCP Server
+User Context Lookup module for Falcon MCP Server
 
-This module provides tools for looking up users in your identity system
-using the Identity Protection GraphQL API. Perfect for getting user context
-when investigating alerts and detections.
+This module provides tools for looking up user context during alert investigation.
+Since Identity Protection GraphQL may not be available, this uses a pragmatic approach:
+lookup users by searching for hosts where they last logged in.
 """
 
 from textwrap import dedent
@@ -18,63 +18,72 @@ from falcon_mcp.modules.base import BaseModule
 
 logger = get_logger(__name__)
 
-# GraphQL query guide
-IDENTITY_LOOKUP_GUIDE = dedent("""
-    # Identity Protection User Lookup Guide
+# User lookup guide
+USER_LOOKUP_GUIDE = dedent("""
+    # User Context Lookup Guide
 
-    Use this module to lookup users in your organization's identity system during alert investigation.
+    This tool looks up user context by searching for hosts where they logged in.
+    This is practical for alert investigation - when you see a username in an alert,
+    find what systems they use to get their context.
 
     ## What This Returns
 
-    - **primaryDisplayName**: User's display name
-    - **emails**: Email addresses
-    - **accounts**: Active Directory account information (domain, SAM name)
-    - **riskAssessment**: Security risk severity and description
-    - **entityId**: Unique identifier in Identity Protection
-    - **archived/learned**: User status flags
+    For each host the user logged into:
+    - **last_login_user**: The username
+    - **last_login_timestamp**: When they last logged in
+    - **hostname**: System they logged into
+    - **os_version**: Windows/Linux/etc
+    - **external_ip**: Their external IP when they logged in
+    - **local_ip**: Internal network IP
+    - **machine_domain**: Domain the system is joined to
+    - **agent_version**: Falcon agent version on that system
+    - **policies**: Active Falcon policies
 
     ## Common Use Cases
 
-    ### Lookup by Email
+    ### Lookup by Exact Username
     ```
-    lookup_user_identity with search_term="derek.dybdahl@respec.com"
-    ```
-
-    ### Lookup by Name
-    ```
-    lookup_user_identity with search_term="Derek Dybdahl"
+    lookup_user_context with search_term="Derek.Dybdahl"
     ```
 
-    ### Lookup by Username
+    ### Lookup by Partial Name
     ```
-    lookup_user_identity with search_term="Derek.Dybdahl"
+    lookup_user_context with search_term="Derek*"
+    ```
+
+    ### Lookup by Domain Username
+    ```
+    lookup_user_context with search_term="RESPEC\\Derek.Dybdahl"
     ```
 
     ## Example Response
 
-    When you lookup a user, you'll get:
-    - Primary display name
-    - All email addresses
-    - Active Directory domain and account name
-    - Risk assessment (severity, description, last updated)
-    - Whether the identity is archived or learned
+    When you lookup a user, you'll get a list of hosts they've logged into with:
+    - Exact username format (domain\\user or UPN)
+    - Last login timestamp
+    - System details (OS, hostname, IPs)
+    - Domain information
+    - When the system was last seen
 
-    ## Integration with Alerts
+    ## Integration with Alert Investigation
 
-    When investigating a detection or incident:
-    1. Extract the username/email from the alert
-    2. Use `falcon_lookup_user_identity` to get full user details
-    3. Check risk assessment for any flagged issues
-    4. Use Active Directory info to understand the account context
+    When investigating a detection with a username:
+    1. Extract the username from the alert (e.g., "Derek.Dybdahl")
+    2. Use `falcon_lookup_user_context` to find their systems
+    3. Check last login time, IP addresses, and OS versions
+    4. Search for detections on those specific hosts if needed
 
-    ## Performance
+    ## Search Tips
 
-    Returns up to 10 matching users. Search matches across display names, emails, and account names.
+    - Use wildcards: "Derek*" matches Derek.Dybdahl, Derek_Test, etc.
+    - Try partial matches: "derek" is case-insensitive
+    - If no results, try variations: Derek vs derek.dybdahl vs DOMAIN\\Derek
+    - The search returns systems where user LAST logged in (not currently logged in)
 """).strip()
 
 
 class IdentityProtectionLookupModule(BaseModule):
-    """Module for looking up users in Identity Protection for alert investigation."""
+    """Module for looking up user context via host data for alert investigation."""
 
     def register_tools(self, server: FastMCP) -> None:
         """Register tools with the MCP server.
@@ -84,8 +93,8 @@ class IdentityProtectionLookupModule(BaseModule):
         """
         self._add_tool(
             server=server,
-            method=self.lookup_user_identity,
-            name="lookup_user_identity",
+            method=self.lookup_user_context,
+            name="lookup_user_context",
         )
 
     def register_resources(self, server: FastMCP) -> None:
@@ -96,165 +105,129 @@ class IdentityProtectionLookupModule(BaseModule):
         """
         lookup_guide = TextResource(
             uri=AnyUrl("falcon://identity-protection/user-lookup-guide"),
-            name="falcon_lookup_user_identity_guide",
-            description="Guide for using the identity protection user lookup tool for alert investigation.",
-            text=IDENTITY_LOOKUP_GUIDE,
+            name="falcon_lookup_user_context_guide",
+            description="Guide for looking up user context via host login history during alert investigation.",
+            text=USER_LOOKUP_GUIDE,
         )
 
         self._add_resource(server, lookup_guide)
 
-    def lookup_user_identity(
+    def lookup_user_context(
         self,
         search_term: str = Field(
-            description="Email address, username, or display name to search for. Examples: 'derek.dybdahl@respec.com', 'Derek Dybdahl', 'Derek.Dybdahl'"
+            description="Username to search for in host login history. Examples: 'Derek.Dybdahl', 'Derek*', 'RESPEC\\\\Derek.Dybdahl', 'derek' (case-insensitive). Wildcards supported."
         ),
     ) -> List[Dict[str, Any]]:
-        """Lookup a user in your identity system using Identity Protection GraphQL.
+        """Lookup user context by finding hosts where they logged in.
 
-        This is perfect for getting user context when investigating alerts and detections.
-        Search matches across emails, display names, and usernames.
+        This tool searches for hosts where a user last logged in, returning
+        system details, IP addresses, domain info, and login timestamps.
+        Perfect for getting user context during alert investigation.
 
-        Returns user details including:
-        - Display names (primary and secondary)
-        - Email addresses
-        - Active Directory account information
-        - Risk assessment (severity, description, last updated)
-        - Entity ID and status (archived, learned)
-
-        Args:
-            search_term: Email, username, or display name to search for
+        Uses FQL filter on last_login_user field. Supports wildcards and
+        case-insensitive matching.
 
         Returns:
-            List of matching user objects with full details
+            List of host records where user logged in with full details
         """
-        logger.debug("Looking up user identity: %s", search_term)
+        logger.debug("Looking up user context: %s", search_term)
 
-        # GraphQL query to search for users
-        # Using simpler syntax that matches Falcon's GraphQL implementation
-        graphql_query = """
-        query SearchUsers($after: String) {
-            entities(
-                types: [USER]
-                archived: false
-                learned: false
-                first: 10
-                after: $after
-            ) {
-                nodes {
-                    entityId
-                    primaryDisplayName
-                    secondaryDisplayName
-                    emails
-                    accounts {
-                        ... on ActiveDirectoryAccountDescriptor {
-                            domain
-                            name
-                            samAccountName
-                        }
-                    }
-                    riskAssessment {
-                        severity
-                        description
-                        lastUpdatedAt
-                    }
-                    archived
-                    learned
-                }
-                pageInfo {
-                    hasNextPage
-                    endCursor
-                }
-            }
-        }
-        """
+        # Build FQL filter for searching by last login user
+        # Supports wildcards and case-insensitive matching
+        fql_filter = f"last_login_user:'{search_term}'"
 
-        # Since the GraphQL API doesn't have built-in text search via filter,
-        # we'll fetch all users and filter client-side
-        # For large deployments, you may want to implement server-side filtering
-        variables = {"after": None}
+        logger.debug("Using FQL filter: %s", fql_filter)
 
-        # Call the Identity Protection GraphQL API
-        response = self._base_query_api_call(
-            operation="api_preempt_proxy_post_graphql",
-            body_params={
-                "query": graphql_query,
-                "variables": variables,
+        # Search hosts using FQL filter
+        response = self._base_search_api_call(
+            operation="QueryDevicesByFilter",
+            search_params={
+                "filter": fql_filter,
+                "limit": 100,
+                "sort": "last_seen.desc",
             },
-            error_message=f"Failed to lookup user: {search_term}",
+            error_message=f"Failed to lookup user context: {search_term}",
             default_result=[],
         )
 
         # Handle error responses
         if self._is_error(response):
-            logger.error("Error looking up user: %s", response)
+            logger.error("Error looking up user context: %s", response)
             return [{"error": response.get("error"), "search_term": search_term}]
 
-        # Extract entities from GraphQL response
-        # The response structure is: {"data": {"entities": {"nodes": [...]}}}
-        try:
-            if isinstance(response, dict):
-                data = response.get("data", {})
-                entities = data.get("entities", {})
-                nodes = entities.get("nodes", [])
+        # response should be a list of device IDs from QueryDevicesByFilter
+        if not response:
+            logger.debug("No hosts found for user: %s", search_term)
+            return [
+                {
+                    "not_found": True,
+                    "search_term": search_term,
+                    "message": f"No systems found with last_login_user matching '{search_term}'",
+                }
+            ]
 
-                if not nodes:
-                    logger.debug("No users found in Identity Protection")
-                    return [
-                        {
-                            "not_found": True,
-                            "search_term": search_term,
-                            "message": "No users found in Identity Protection. Identity Protection may not be enabled or no users indexed yet.",
-                        }
-                    ]
+        # Now get full details for those devices
+        device_ids = response if isinstance(response, list) else [response]
+        logger.debug("Found %d device(s), fetching details", len(device_ids))
 
-                # Filter results client-side based on search term
-                search_lower = search_term.lower()
-                filtered_nodes = []
+        device_details = self._base_get_by_ids(
+            operation="GetDeviceDetails",
+            ids=device_ids,
+            error_message=f"Failed to get details for user {search_term} hosts",
+        )
 
-                for node in nodes:
-                    # Check multiple fields for match
-                    primary_name = node.get("primaryDisplayName", "").lower()
-                    secondary_name = node.get("secondaryDisplayName", "").lower()
-                    emails = [e.lower() for e in node.get("emails", [])]
+        if self._is_error(device_details):
+            logger.error("Error getting device details: %s", device_details)
+            return [{"error": device_details.get("error")}]
 
-                    # Also check AD account names
-                    accounts = node.get("accounts", [])
-                    account_names = [
-                        (a.get("samAccountName", "") or a.get("name", "")).lower()
-                        for a in accounts
-                    ]
+        if not device_details:
+            logger.debug("No device details returned")
+            return [
+                {
+                    "not_found": True,
+                    "search_term": search_term,
+                    "message": "Found hosts but could not retrieve details",
+                }
+            ]
 
-                    # Match if search term appears in any field
-                    if any(
-                        search_lower in field
-                        for field in [
-                            primary_name,
-                            secondary_name,
-                            *emails,
-                            *account_names,
-                        ]
-                        if field
-                    ):
-                        filtered_nodes.append(node)
+        # Extract and format user context from device details
+        user_contexts = []
 
-                if filtered_nodes:
-                    logger.debug(
-                        "Found %d user(s) matching: %s", len(filtered_nodes), search_term
-                    )
-                    return filtered_nodes
-                else:
-                    logger.debug("No users matched search term: %s", search_term)
-                    return [
-                        {
-                            "not_found": True,
-                            "search_term": search_term,
-                            "message": f"No users found matching '{search_term}'",
-                        }
-                    ]
-            else:
-                logger.error("Unexpected response format: %s", response)
-                return [{"error": "Unexpected response format"}]
+        devices = device_details if isinstance(device_details, list) else [device_details]
+        for device in devices:
+            if isinstance(device, dict):
+                # Extract relevant user/context fields
+                context = {
+                    "last_login_user": device.get("last_login_user"),
+                    "last_login_user_sid": device.get("last_login_user_sid"),
+                    "last_login_timestamp": device.get("last_login_timestamp"),
+                    "hostname": device.get("hostname"),
+                    "machine_domain": device.get("machine_domain"),
+                    "os_version": device.get("os_version"),
+                    "platform_name": device.get("platform_name"),
+                    "build_number": device.get("build_number"),
+                    "external_ip": device.get("external_ip"),
+                    "local_ip": device.get("local_ip"),
+                    "mac_address": device.get("mac_address"),
+                    "agent_version": device.get("agent_version"),
+                    "last_seen": device.get("last_seen"),
+                    "first_seen": device.get("first_seen"),
+                    "device_id": device.get("device_id"),
+                    "cid": device.get("cid"),
+                }
+                user_contexts.append(context)
 
-        except Exception as e:
-            logger.error("Error parsing GraphQL response: %s", e)
-            return [{"error": str(e)}]
+        if user_contexts:
+            logger.debug(
+                "Found %d system(s) for user: %s", len(user_contexts), search_term
+            )
+            return user_contexts
+        else:
+            logger.debug("No user context extracted from device details")
+            return [
+                {
+                    "not_found": True,
+                    "search_term": search_term,
+                    "message": "Could not extract user context from host details",
+                }
+            ]
